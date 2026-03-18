@@ -1,21 +1,23 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+Colab-friendly Sokoban GUI.
 
-import tkinter as tk
-from tkinter.filedialog import askopenfilename
-    
+This replaces Tkinter with an in-notebook renderer (PIL + matplotlib) and ipywidgets controls.
+It preserves the original gameplay/solver integration:
+- Warehouse loading
+- Move player with box pushing rules
+- Show box weights
+- Call solve_weighted_sokoban and step/play the returned plan
+
+Run in Google Colab / Jupyter.
+"""
+
 import os
+import time
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List, Union
 
 from sokoban import Warehouse
-
-# Written by f.maire@qut.edu.au using icon images from Risto Stevcev.
-# Last modified on 2022/05/2
-# fix the inconsistency of the capitalization of 'impossible'
-
-import time
-
-__author__ = "Frederic Maire"
-__version__ = "2.0"
-
 
 try:
     from fredSokobanSolver import solve_weighted_sokoban
@@ -24,337 +26,331 @@ except ModuleNotFoundError:
     from mySokobanSolver import solve_weighted_sokoban
     print("Using submitted solver")
 
-    
+# Notebook UI/Rendering
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
+from IPython.display import display, clear_output
+import ipywidgets as widgets
 
-# directory where this file is located
-app_root_folder = os.getcwd()
-
-# creating tkinter root/main window
-root_window = tk.Tk()
-root_window.geometry('550x180')
-
-# tk.Frame containing the warehouse
-frame = tk.Frame(master=root_window)
-frame.pack()
-
-# move actions 
-direction_offset = {'Left' :(-1,0), 'Right':(1,0) , 'Up':(0,-1), 'Down':(0,1)} # (x,y) = (column,row)
-
-# dictionary of images for the display of the warehouse
-image_dict={'wall':tk.PhotoImage(file=os.path.join(app_root_folder, 'images/wall.gif')),
-                 'target':tk.PhotoImage(file=os.path.join(app_root_folder, 'images/hole.gif')),
-                 'box_on_target':tk.PhotoImage(file=os.path.join(app_root_folder, 'images/crate-in-hole.gif')),
-                 'box':tk.PhotoImage(file=os.path.join(app_root_folder, 'images/crate.gif')),
-                 'worker':tk.PhotoImage(file=os.path.join(app_root_folder, 'images/player.gif')),
-                 'smiley':tk.PhotoImage(file=os.path.join(app_root_folder, 'images/smiley.gif')),
-                 'worker_on_target':tk.PhotoImage(file=os.path.join(app_root_folder, 'images/player-in-hole.gif')),
-                 }
+__author__ = "Frederic Maire (original), Colab adaptation"
+__version__ = "2.0-colab"
 
 
+# Move actions
+direction_offset = {
+    "Left": (-1, 0),
+    "Right": (1, 0),
+    "Up": (0, -1),
+    "Down": (0, 1),
+}
 
-#----------------------------------------------------------------------------
+CELL_SIZE = 50  # pixels, like original
 
-#  Global variables
 
-# file path to the current warehouse
-warehouse_path = None
-warehouse = None
-cells = dict()  # cells[(x,y)] is the canvas of the cell (x,y) of the warehouse
-solution = None # sequence of action returned by the solver (or 'Impossible')
+@dataclass
+class Assets:
+    tiles: Dict[str, Image.Image]
+    font: Optional[ImageFont.ImageFont]
 
-#----------------------------------------------------------------------------
 
-def welcome_frame():
-     tk.Label(frame, text="\n *** Welcome to Sokoban! ***\n").grid(row=0, column=0)
+def _load_assets(app_root_folder: str) -> Assets:
+    """
+    Load the original gif assets using PIL. If missing, create simple placeholders.
+    """
+    def load_gif(path: str, fallback_color: Tuple[int, int, int], label: str) -> Image.Image:
+        if os.path.exists(path):
+            img = Image.open(path).convert("RGBA")
+            # Some gifs might be larger/smaller; normalize to CELL_SIZE
+            if img.size != (CELL_SIZE, CELL_SIZE):
+                img = img.resize((CELL_SIZE, CELL_SIZE))
+            return img
+        # fallback placeholder
+        img = Image.new("RGBA", (CELL_SIZE, CELL_SIZE), fallback_color + (255,))
+        d = ImageDraw.Draw(img)
+        d.text((4, 16), label[:6], fill=(0, 0, 0, 255))
+        return img
 
-     tk.Label(frame, text="To load a warehouse: File -> Open\n").grid(row=1, column=0)
+    images_dir = os.path.join(app_root_folder, "images")
 
-     tk.Label(frame, text="To reset the current warehouse: press the 'r' key \n").grid(row=3, column=0)
+    tiles = {
+        "wall": load_gif(os.path.join(images_dir, "wall.gif"), (120, 120, 120), "wall"),
+        "target": load_gif(os.path.join(images_dir, "hole.gif"), (240, 220, 120), "tgt"),
+        "box_on_target": load_gif(os.path.join(images_dir, "crate-in-hole.gif"), (200, 150, 80), "b@t"),
+        "box": load_gif(os.path.join(images_dir, "crate.gif"), (200, 150, 80), "box"),
+        "worker": load_gif(os.path.join(images_dir, "player.gif"), (120, 180, 255), "me"),
+        "smiley": load_gif(os.path.join(images_dir, "smiley.gif"), (255, 255, 120), ":)"),
+        "worker_on_target": load_gif(os.path.join(images_dir, "player-in-hole.gif"), (120, 180, 255), "me@t"),
+    }
 
-     tk.Label(frame, text="To call your solve_weighted_sokoban solver: Solve -> Plan action sequence\n").grid(row=4, column=0)
-
-     tk.Label(frame, text="To step through your solution: press the 's' key \n").grid(row=5, column=0)
-
-     tk.Label(frame, text="To print help on the console: press the 'h' key \n").grid(row=6, column=0)
-
-     frame.pack()
-     
-#----------------------------------------------------------------------------
-
-def get_box_weight(x,y):
-    '''
-    Get the weight of the box at position x,y
-    in the current warehouse.
-    If no weight given return 0
-    '''
+    # Try to get a reasonable font; fall back to default
+    font = None
     try:
-        w = warehouse.weights[warehouse.boxes.index((x,y))]
-    except:
-        w = 0
-    return w
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
 
-#----------------------------------------------------------------------------
+    return Assets(tiles=tiles, font=font)
 
-def make_cell(cell_type, box_weight = None):
-    '''
-    Create a canvas for a cell of the warehouse
-    Return a painted canvas
-    
-    PRE: 
-        frame has been created
-    '''
-    canvas = tk.Canvas(frame,
-                       width=50, 
-                       height=50)
-    background_image = image_dict[cell_type]
-    canvas.create_image(0, 0, anchor=tk.NW, image=background_image)
-    if box_weight != None:
-        canvas.create_text(25, 25, text= str(box_weight),
-                       fill="black",font=('Helvetica 15 bold'))
-    return canvas
 
-#----------------------------------------------------------------------------
+class SokobanColabGUI:
+    def __init__(self, app_root_folder: Optional[str] = None):
+        self.app_root_folder = app_root_folder or os.getcwd()
+        self.assets = _load_assets(self.app_root_folder)
 
-def clear_level():
-    '''
-    Clear the current warehouse (aka level)    
-    '''
-    global frame, warehouse, cells, solution
-    if frame:
-        frame.destroy()
-    frame = tk.Frame(master=root_window)
-    warehouse = Warehouse() # warehouse
-    cells = dict() 
-    solution = None
+        self.warehouse_path: Optional[str] = None
+        self.warehouse: Optional[Warehouse] = None
 
-# ----------------------------------------------------------------------------
+        # solution is either None, 'Impossible', or list[str]
+        self.solution: Optional[Union[str, List[str]]] = None
+        self.total_cost: Optional[float] = None
 
-def select_warehouse():
-    '''
-    Load a warehouse
-    '''
-    global frame, warehouse_path
-    # frame.pack_forget() # todo: move this line to clear_level?!
-    warehouse_path = askopenfilename(
-                        initialdir=os.path.join(app_root_folder, 'warehouses'))
-    print( f"Loading warehouse {warehouse_path}")
-    start_level()
-    
-# ----------------------------------------------------------------------------
+        # UI widgets
+        self.out = widgets.Output()
+        self.status = widgets.HTML()
 
-def start_level():
-    '''
-    Reset the warehouse and display it    
-    '''
-    clear_level()
-    warehouse.load_warehouse(warehouse_path)
-    root_window.title(f'Sokoban v{__version__} - {warehouse_path.split("/")[-1]}' )
-    geom = str(warehouse.ncols*52)+'x'+str(warehouse.nrows*52)
-    root_window.geometry(geom)
-    fresh_display()
- 
-# ----------------------------------------------------------------------------
+        self.path_box = widgets.Text(
+            description="Warehouse:",
+            placeholder="e.g. warehouses/warehouse_01.txt",
+            layout=widgets.Layout(width="650px"),
+        )
+        self.load_btn = widgets.Button(description="Load", button_style="primary")
+        self.reset_btn = widgets.Button(description="Reset (r)", button_style="")
+        self.solve_btn = widgets.Button(description="Solve", button_style="warning")
+        self.step_btn = widgets.Button(description="Step (s)", button_style="")
+        self.play_btn = widgets.Button(description="Play", button_style="success")
+        self.stop_btn = widgets.Button(description="Stop", button_style="danger")
 
-def clean_cell(x,y):
-    '''
-    Destroy the widget in cells[(x,y)] and remove the entry 
-    from the dictionary
-    '''
-    if (x,y) in cells:
-        cells[(x,y)].destroy()
-        del cells[(x,y)]
-    
-# ----------------------------------------------------------------------------
+        self.left_btn = widgets.Button(description="←")
+        self.right_btn = widgets.Button(description="→")
+        self.up_btn = widgets.Button(description="↑")
+        self.down_btn = widgets.Button(description="↓")
 
-def fresh_display():
-    '''
-    First display of the warehouse
-    Setup the cells dictionary
-    '''
-    for x,y in warehouse.walls:
-        cells[(x,y)] = make_cell('wall')
-        cells[(x,y)].grid(row=y,column=x)
-    for x,y in warehouse.targets:
-        cells[(x,y)] = make_cell('target')
-        cells[(x,y)].grid(row=y,column=x)
-    for x,y in warehouse.boxes:
-        if (x,y) in warehouse.targets:
-            clean_cell(x,y)
-            cells[(x,y)] = make_cell('box_on_target', get_box_weight(x, y))      
-            cells[(x,y)].grid(row=y,column=x)
+        self.speed = widgets.IntSlider(description="Delay ms", min=50, max=1000, step=50, value=300)
+
+        self._playing = False
+
+        # Wire events
+        self.load_btn.on_click(lambda _b: self.load_warehouse(self.path_box.value.strip() or None))
+        self.reset_btn.on_click(lambda _b: self.reset_level())
+        self.solve_btn.on_click(lambda _b: self.solve_puzzle())
+        self.step_btn.on_click(lambda _b: self.step_solution())
+        self.play_btn.on_click(lambda _b: self.play_solution())
+        self.stop_btn.on_click(lambda _b: self.stop())
+
+        self.left_btn.on_click(lambda _b: self.move_player("Left"))
+        self.right_btn.on_click(lambda _b: self.move_player("Right"))
+        self.up_btn.on_click(lambda _b: self.move_player("Up"))
+        self.down_btn.on_click(lambda _b: self.move_player("Down"))
+
+    # ----------------------------
+    # Core game logic (ported)
+    # ----------------------------
+
+    def get_box_weight(self, x: int, y: int) -> int:
+        """
+        Get the weight of the box at position (x,y) in the current warehouse.
+        If no weight given return 0.
+        """
+        if not self.warehouse:
+            return 0
+        try:
+            return self.warehouse.weights[self.warehouse.boxes.index((x, y))]
+        except Exception:
+            return 0
+
+    def load_warehouse(self, warehouse_path: Optional[str]):
+        if not warehouse_path:
+            self._set_status("Provide a warehouse path (relative to repo or absolute path).", error=True)
+            return
+
+        self.warehouse_path = warehouse_path
+        w = Warehouse()
+        w.load_warehouse(warehouse_path)
+        self.warehouse = w
+        self.solution = None
+        self.total_cost = None
+        self._set_status(f"Loaded: {warehouse_path}")
+        self.render()
+
+    def reset_level(self):
+        if not self.warehouse_path:
+            self._set_status("Nothing to reset: load a warehouse first.", error=True)
+            return
+        self.load_warehouse(self.warehouse_path)
+
+    def try_move_box(self, location: Tuple[int, int], next_location: Tuple[int, int]) -> bool:
+        """
+        Move the box from 'location' to 'next_location' if possible.
+        Return True if moved else False.
+        """
+        assert self.warehouse is not None
+        x, y = location
+        nx, ny = next_location
+
+        assert (x, y) in self.warehouse.boxes
+        if (nx, ny) not in self.warehouse.walls and (nx, ny) not in self.warehouse.boxes:
+            bi = self.warehouse.boxes.index((x, y))
+            self.warehouse.boxes[bi] = (nx, ny)
+            return True
+        return False
+
+    def move_player(self, direction: str):
+        if not self.warehouse:
+            self._set_status("Load a warehouse first.", error=True)
+            return
+        if direction not in direction_offset:
+            return
+
+        x, y = self.warehouse.worker
+        dx, dy = direction_offset[direction]
+        nx, ny = x + dx, y + dy
+
+        # blocked by wall
+        if (nx, ny) in self.warehouse.walls:
+            return
+
+        # pushing a box?
+        if (nx, ny) in self.warehouse.boxes:
+            if not self.try_move_box((nx, ny), (nx + dx, ny + dy)):
+                return
+
+        self.warehouse.worker = (nx, ny)
+        self.render()
+
+    def puzzle_solved(self) -> bool:
+        if not self.warehouse:
+            return False
+        return all(b in self.warehouse.targets for b in self.warehouse.boxes)
+
+    # ----------------------------
+    # Solver integration
+    # ----------------------------
+
+    def solve_puzzle(self):
+        if not self.warehouse:
+            self._set_status("First load a warehouse.", error=True)
+            return
+
+        self._set_status("Starting to think...")
+        t0 = time.time()
+        solution, total_cost = solve_weighted_sokoban(self.warehouse)
+        t1 = time.time()
+
+        self.solution = solution
+        self.total_cost = total_cost
+
+        if solution == "Impossible":
+            self._set_status(f"No solution found. (analysis {t1 - t0:.6f}s)", error=True)
         else:
-            cells[(x,y)] = make_cell('box', get_box_weight(x,y))      
-            cells[(x,y)].grid(row=y,column=x)
-    x,y = warehouse.worker
-    if (x,y) in warehouse.targets:
-        cells[(x,y)].destroy() 
-        cells[(x,y)] = make_cell('worker_on_target')      
-    else:
-        cells[(x,y)] = make_cell('worker')      
-    cells[(x,y)].grid(row=y,column=x)
-    frame.pack(fill = tk.BOTH, expand = True)
-    
-# ----------------------------------------------------------------------------
+            self._set_status(f"Solution found. cost={total_cost} (analysis {t1 - t0:.6f}s), steps={len(solution)}")
+        self.render()
 
-def move_player(direction):
-    '''
-    direction in ['Left', 'Right', 'Up', 'Down']:
-    Check whether the worker is pushing a box
-    '''
-    global warehouse
-    x,y = warehouse.worker
-    xy_offset = direction_offset[direction]
-    next_x , next_y = x+xy_offset[0] , y+xy_offset[1] # where the player will go if possible
-    # Let's find out if it is possible to move the player in this direction
-    if (next_x,next_y) in warehouse.walls:
-        return # impossible move, do nothing
-    if (next_x,next_y) in warehouse.boxes:
-        if try_move_box( (next_x,next_y), (next_x+xy_offset[0],next_y+xy_offset[1]) ) == False:
-            return # box next to the player could not be pushed
-    # now, the cell next to the player must be empty or with a box that can be moved
-    # we still have to move the player
-    clean_cell(x, y)
-    clean_cell(next_x,next_y)
-    # Test whether the appearance of the player need to change on the next cell
-    if (next_x,next_y) in warehouse.targets:
-        cells[(next_x,next_y)] = make_cell('worker_on_target')
-    else:
-        cells[(next_x,next_y)] = make_cell('worker')
-    cells[(next_x,next_y)].grid(row=next_y,column=next_x) # move it to the next cell
-    warehouse.worker = (next_x,next_y)
-    # update the cell where the player was
-    if (x,y) in warehouse.targets:
-        # cell x,y has already been cleaned
-        cells[(x,y)] = make_cell('target')      
-        cells[(x,y)].grid(row=y,column=x)
-    puzzle_solved = all(z in warehouse.targets for z in warehouse.boxes)
-    if puzzle_solved:
-        x,y = warehouse.worker
-        # widget in the cell currently containing the player
-        clean_cell(x, y)
-        cells[(x,y)] = make_cell('smiley') 
-        cells[(x,y)].grid(row=y,column=x)
-    frame.pack()
-          
-# ----------------------------------------------------------------------------
+    def step_solution(self):
+        if not self.solution or self.solution == "Impossible":
+            return
+        if isinstance(self.solution, list) and len(self.solution) > 0:
+            step = self.solution.pop(0)
+            self.move_player(step)
 
-def try_move_box(location, next_location):
-    '''
-    location and next_location are (x,y) tuples
-    Move the box  from 'location' to 'next_location'
-    Note that we assume that there is a wall around the warehouse!
-    Return True if the box was moved, return False if the box could not be moved
-    Update the position and the image of the  widget for this box
-    '''
-    x, y = location
-    next_x, next_y = next_location
+    def play_solution(self):
+        if not self.solution or self.solution == "Impossible":
+            return
+        self._playing = True
+        while self._playing and isinstance(self.solution, list) and len(self.solution) > 0:
+            self.step_solution()
+            time.sleep(self.speed.value / 1000.0)
+        self._playing = False
 
-    assert (x,y) in warehouse.boxes
-    if (next_x, next_y) not in warehouse.walls and (next_x, next_y) not in warehouse.boxes:
-        # can move the box!
-        # the cell (x,y) is cleaned by 'move_player'
-        # clean cell (next_x,next_y)
-        if (next_x,next_y) in cells:
-            assert (next_x,next_y) in warehouse.targets
-            clean_cell(next_x,next_y)
-        # new widget for the moved box
-        if (next_x,next_y) in warehouse.targets:
-            cells[(next_x,next_y)] = make_cell('box_on_target', get_box_weight(x,y))            
-        else:
-            cells[(next_x,next_y)] = make_cell('box',  get_box_weight(x,y)) 
-        cells[(next_x,next_y)].grid(row=next_y, column=next_x)
-        # we have to preserve the position of the box in the list boxes
-        bi = warehouse.boxes.index((x,y))
-        warehouse.boxes[bi] = (next_x,next_y)
-        # we don't have to update (x,y), this will be done while moving the player
-        return True # move successful
-    else:
-        return False # box was blocked
+    def stop(self):
+        self._playing = False
 
-# ----------------------------------------------------------------------------
+    # ----------------------------
+    # Rendering (board -> image)
+    # ----------------------------
 
-def solve_puzzle():
-    global solution
-    if warehouse is None:
-        print('\nFirst load a warehouse!!\n')
-        return
-    print('\nStarting to think...\n')
-    t0 = time.time()
-    solution, total_cost = solve_weighted_sokoban(warehouse)
-    t1 = time.time()
-    print (f'\nAnalysis took {t1-t0:.6f} seconds\n')
-    if solution == 'Impossible':
-        print('\nNo solution found!\n')
-    else:
-        print(f"\nSolution found with a cost of {total_cost} \n", solution, '\n')
-    
-# ----------------------------------------------------------------------------
-    
-def play_solution():
-    global solution
-    if solution and len(solution) > 0:
-        move_player(solution.pop(0))
-        root_window.after(300, play_solution)
-    
-# ----------------------------------------------------------------------------
+    def _set_status(self, msg: str, error: bool = False):
+        color = "#b00020" if error else "#1b5e20"
+        self.status.value = f"<b>Status:</b> <span style='color:{color}'>{msg}</span>"
 
-def key_handler(event):
-    if event.keysym in ('Left', 'Right', 'Up', 'Down'): 
-        move_player(event.keysym)
-    if event.keysym in ('r','R'):
-        if warehouse_path:
-            start_level()
-    if event.keysym in ('s','S'):
-        if solution and len(solution) > 0:
-            move_player(solution.pop(0))
-    if event.keysym in ('h','H'):
-        print(
-'''
-To load a warehouse: File -> Open
-To reset the current warehouse: press the 'r' key
-To call your solve_weighted_sokoban solver: Plan action sequence 
-To step through your solution: press the 's' key 
-To print help on the console: press the 'h' key 
-''')
+    def render(self):
+        with self.out:
+            clear_output(wait=True)
+            if not self.warehouse:
+                print("Welcome to Sokoban (Colab edition).\nLoad a warehouse to begin.")
+                return
 
-# ----------------------------------------------------------------------------
-        
-#  Create the GUI        
-        
-root_window.title('Weighted Sokoban')
-root_window.iconphoto(
-    False, 
-    tk.PhotoImage(file=os.path.join(app_root_folder, 'images/crate.gif'))
-    )
+            w = self.warehouse
+            img = Image.new("RGBA", (w.ncols * CELL_SIZE, w.nrows * CELL_SIZE), (255, 255, 255, 255))
+
+            # Base: blank -> draw targets -> walls -> boxes -> worker
+            # (Order chosen to mimic original look.)
+            for (x, y) in w.targets:
+                img.alpha_composite(self.assets.tiles["target"], (x * CELL_SIZE, y * CELL_SIZE))
+
+            for (x, y) in w.walls:
+                img.alpha_composite(self.assets.tiles["wall"], (x * CELL_SIZE, y * CELL_SIZE))
+
+            # Boxes
+            for (x, y) in w.boxes:
+                tile_key = "box_on_target" if (x, y) in w.targets else "box"
+                img.alpha_composite(self.assets.tiles[tile_key], (x * CELL_SIZE, y * CELL_SIZE))
+
+                # Weight overlay
+                weight = self.get_box_weight(x, y)
+                if weight and self.assets.font:
+                    d = ImageDraw.Draw(img)
+                    d.text(
+                        (x * CELL_SIZE + 18, y * CELL_SIZE + 15),
+                        str(weight),
+                        fill=(0, 0, 0, 255),
+                        font=self.assets.font,
+                    )
+
+            # Worker / solved smiley
+            wx, wy = w.worker
+            if self.puzzle_solved():
+                img.alpha_composite(self.assets.tiles["smiley"], (wx * CELL_SIZE, wy * CELL_SIZE))
+            else:
+                tile_key = "worker_on_target" if (wx, wy) in w.targets else "worker"
+                img.alpha_composite(self.assets.tiles[tile_key], (wx * CELL_SIZE, wy * CELL_SIZE))
+
+            # Show
+            plt.figure(figsize=(w.ncols * 0.55, w.nrows * 0.55))
+            plt.imshow(img)
+            plt.axis("off")
+            plt.show()
+
+            # Some extra info
+            if self.solution == "Impossible":
+                print("Solver: Impossible")
+            elif isinstance(self.solution, list):
+                print(f"Solver: {len(self.solution)} remaining steps. (press Step/Play)")
+            else:
+                print("Solver: not run yet.")
+
+    # ----------------------------
+    # Display UI
+    # ----------------------------
+
+    def show(self):
+        controls_top = widgets.HBox([self.path_box, self.load_btn, self.reset_btn])
+        controls_solver = widgets.HBox([self.solve_btn, self.step_btn, self.play_btn, self.stop_btn, self.speed])
+        controls_moves = widgets.HBox([self.up_btn, self.left_btn, self.down_btn, self.right_btn])
+        ui = widgets.VBox([self.status, controls_top, controls_solver, controls_moves, self.out])
+
+        self._set_status("Ready. Enter a warehouse path and click Load.")
+        display(ui)
+        self.render()
 
 
-# Creating Menubar
-menubar = tk.Menu(root_window)
-root_window.config(menu=menubar)
-  
-# Adding File Menu and commands
-file_menu = tk.Menu(menubar, tearoff = 0)
-menubar.add_cascade(label ='File', menu = file_menu)
-file_menu.add_command(label ='Load warehouse', command = select_warehouse)
-file_menu.add_command(label="Restart puzzle", command=start_level)
-file_menu.add_separator()
-file_menu.add_command(label ='Quit', command = root_window.destroy)
-
-# Adding File Solve Menu and commands
-solve_menu = tk.Menu(menubar, tearoff = 0)
-menubar.add_cascade(label ='Solve', menu = solve_menu)
-solve_menu.add_command(label ='Plan action sequence', command = solve_puzzle)
-solve_menu.add_command(label ='Play action sequence', command = play_solution)
-
-
-clear_level()
-welcome_frame()
-
-root_window.bind_all("<Key>", key_handler)
-root_window.mainloop()
-
-# + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + 
-#                              CODE CEMETARY
-# + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + 
-
-
+# Convenience entry point
+def launch_colab_gui(app_root_folder: Optional[str] = None, warehouse_path: Optional[str] = None):
+    gui = SokobanColabGUI(app_root_folder=app_root_folder)
+    gui.show()
+    if warehouse_path:
+        gui.path_box.value = warehouse_path
+        gui.load_warehouse(warehouse_path)
+    return gui
